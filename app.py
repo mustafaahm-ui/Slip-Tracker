@@ -1,156 +1,205 @@
 import streamlit as st
 import cv2
 import numpy as np
-import pandas as pd
-import tempfile
-import os
-from ultralytics import YOLO
 import time
+from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 import av
 
 # --- إعداد الصفحة ---
-st.set_page_config(page_title="Tractor Slip Analyzer", layout="wide", page_icon="🚜")
+st.set_page_config(page_title="Live Tractor Speed Trap", layout="wide", page_icon="🚜")
 
-# --- تهيئة متغيرات الذاكرة ---
+# --- تهيئة الذاكرة (Session State) ---
+# المتغيرات التي نريد حفظها بين التبويبات
 if 'v_theo' not in st.session_state:
     st.session_state.v_theo = 0.0
-if 'ppm' not in st.session_state:
-    st.session_state.ppm = 0.0  # Pixels per meter
+if 'last_measured_speed' not in st.session_state:
+    st.session_state.last_measured_speed = 0.0
 
-# --- دوال مساعدة ---
+# القيم الافتراضية للخطوط (لتعديلها من الواجهة)
+if 'line1_percent' not in st.session_state: st.session_state.line1_percent = 20
+if 'line2_percent' not in st.session_state: st.session_state.line2_percent = 80
+if 'trap_distance' not in st.session_state: st.session_state.trap_distance = 20.0
+if 'reset_trigger' not in st.session_state: st.session_state.reset_trigger = False
+
+# --- تحميل الموديل ---
 @st.cache_resource
 def load_model():
-    return YOLO('best.pt')
+    try:
+        return YOLO('best.pt')
+    except:
+        return YOLO('yolov8n.pt')
 
-try:
-    model = load_model()
-except:
-    st.error("Model 'best.pt' not found!")
-    st.stop()
+model = load_model()
 
-# --- فئة معالجة الفيديو المباشر (WebRTC) ---
-class TractorTracker(VideoTransformerBase):
+# --- كلاس معالجة الفيديو (المخ المنفذ) ---
+class SpeedTrapProcessor(VideoTransformerBase):
     def __init__(self):
-        self.ppm = st.session_state.ppm
-        self.v_theo = st.session_state.v_theo
-        self.mode = "calibrating" if self.v_theo == 0 else "measuring"
-        self.prev_y = None
-        self.last_time = time.time()
-        self.dist_accumulated = 0
         self.model = model
-
+        self.start_time = None
+        self.end_time = None
+        self.measured_speed = 0.0
+        self.state = "WAITING" # WAITING -> RUNNING -> FINISHED
+        
+        # لقراءة الإعدادات الحالية من الواجهة
+        self.l1_pct = st.session_state.get('line1_percent', 20)
+        self.l2_pct = st.session_state.get('line2_percent', 80)
+        self.dist = st.session_state.get('trap_distance', 20.0)
+        
     def transform(self, frame):
+        # التحقق من طلب إعادة الضبط (Reset)
+        if st.session_state.get('reset_trigger', False):
+            self.start_time = None
+            self.end_time = None
+            self.measured_speed = 0.0
+            self.state = "WAITING"
+            # لا نستطيع تغيير session_state هنا، لذا سنعتمد على أن الزر في الواجهة سيغيره
+        
+        # تحديث مواقع الخطوط ديناميكياً إذا غيرها المستخدم
+        self.l1_pct = st.session_state.get('line1_percent', 20)
+        self.l2_pct = st.session_state.get('line2_percent', 80)
+        self.dist = st.session_state.get('trap_distance', 20.0)
+
         img = frame.to_ndarray(format="bgr24")
         h, w, _ = img.shape
-        current_time = time.time()
         
-        # تتبع الكائنات
+        # تحويل النسب إلى بكسل
+        x1 = int(w * (self.l1_pct / 100))
+        x2 = int(w * (self.l2_pct / 100))
+        
+        # تتبع الجرار
         results = self.model.track(img, persist=True, verbose=False)
         
-        curr_speed_kmh = 0.0
-        slip_ratio = 0.0
+        tractor_x = 0
+        detected = False
         
         if results[0].boxes.id is not None:
+            # نأخذ أول كائن (الجرار)
             box = results[0].boxes.xyxy[0].cpu().numpy()
-            center_y = int((box[1] + box[3]) / 2)
+            # نستخدم مقدمة الجرار (أقصى اليمين للمربع إذا كان يتجه لليمين)
+            # أو المركز ليكون أدق
+            tractor_x = int((box[0] + box[2]) / 2)
+            detected = True
             
-            # رسم المربع
-            cv2.rectangle(img, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 2)
-            
-            # حساب السرعة
-            if self.prev_y is not None and self.ppm > 0:
-                pixel_move = abs(center_y - self.prev_y)
-                time_diff = current_time - self.last_time
+            # رسم الجرار
+            cv2.rectangle(img, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 255), 2)
+            cv2.circle(img, (tractor_x, int((box[1]+box[3])/2)), 8, (0, 0, 255), -1)
+
+        # --- منطق القياس (Timing Logic) ---
+        current_t = time.time()
+        
+        if self.state == "WAITING":
+            if detected and tractor_x > x1:
+                self.start_time = current_t
+                self.state = "RUNNING"
                 
-                if time_diff > 0:
-                    dist_m = pixel_move / self.ppm
-                    speed_ms = dist_m / time_diff
-                    curr_speed_kmh = speed_ms * 3.6
+        elif self.state == "RUNNING":
+            if detected and tractor_x > x2:
+                self.end_time = current_t
+                self.state = "FINISHED"
+                
+                # حساب السرعة فوراً
+                duration = self.end_time - self.start_time
+                if duration > 0:
+                    speed_ms = self.dist / duration
+                    self.measured_speed = speed_ms * 3.6 # كم/ساعة
                     
-                    # تنعيم القراءة (تجاهل القفزات غير المنطقية)
-                    if curr_speed_kmh < 30: 
-                        self.dist_accumulated += dist_m
-
-            self.prev_y = center_y
-            self.last_time = current_time
+                    # حفظ النتيجة في مكان يمكن للواجهة قراءته (خدعة الـ Queue ممكنة لكن هنا سنعرضها فقط)
         
-        # --- عرض المعلومات على الشاشة ---
+        # --- الرسم على الشاشة ---
+        # الخط الأول (Start)
+        color_l1 = (0, 255, 0) if self.state == "WAITING" else (100, 100, 100)
+        cv2.line(img, (x1, 0), (x1, h), color_l1, 2)
+        cv2.putText(img, "START", (x1+5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_l1, 2)
         
-        # 1. وضع المعايرة (الأسفلت)
-        if self.mode == "calibrating":
-            cv2.putText(img, "MODE: REFERENCE RUN (ASPHALT)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            cv2.putText(img, f"Current Speed: {curr_speed_kmh:.1f} km/h", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+        # الخط الثاني (Finish)
+        color_l2 = (0, 0, 255)
+        cv2.line(img, (x2, 0), (x2, h), color_l2, 2)
+        cv2.putText(img, "FINISH", (x2+5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_l2, 2)
+        
+        # عرض الحالة والسرعة
+        cv2.rectangle(img, (0, 0), (w, 80), (0, 0, 0), -1) # شريط علوي أسود
+        
+        if self.state == "WAITING":
+            status_text = "READY: Drive Tractor ->"
+            cv2.putText(img, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             
-            # هنا نقوم فقط بعرض السرعة، والمستخدم سيأخذ القيمة يدوياً أو نطور كوداً لحفظها
+        elif self.state == "RUNNING":
+            elapsed = current_t - self.start_time
+            status_text = f"MEASURING... Time: {elapsed:.2f} s"
+            cv2.putText(img, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
             
-        # 2. وضع القياس (الحقل)
-        else:
-            if self.v_theo > 0:
-                slip_ratio = ((self.v_theo - curr_speed_kmh) / self.v_theo) * 100
-            
-            # ألوان الحالة
-            color = (0, 255, 0)
-            status = "Safe"
-            if slip_ratio > 15: color, status = (0, 255, 255), "Warning"
-            if slip_ratio > 20: color, status = (0, 0, 255), "Slip!"
-
-            cv2.rectangle(img, (0, 0), (350, 150), (0, 0, 0), -1)
-            cv2.putText(img, f"V_Act: {curr_speed_kmh:.1f} km/h", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(img, f"V_Ref: {self.v_theo:.1f} km/h", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 1)
-            cv2.putText(img, f"SLIP: {slip_ratio:.1f}%", (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+        elif self.state == "FINISHED":
+            res_text = f"DONE! Speed: {self.measured_speed:.2f} km/h"
+            cv2.putText(img, res_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
         return img
 
 # --- واجهة المستخدم ---
-st.title("🚜 Live Tractor Slip Detector")
+st.title("🚜 Live Timing Gate (Camera)")
 
-# اختيار المصدر
-source_option = st.radio("Select Input Source:", ("📂 Upload Video", "📷 Live Camera (WebRTC)"))
+# أزرار التحكم العلوية
+col_conf1, col_conf2, col_conf3 = st.columns([1, 2, 1])
+with col_conf1:
+    dist_input = st.number_input("Trap Distance (m)", value=20.0, step=1.0)
+    st.session_state.trap_distance = dist_input
+with col_conf2:
+    # أزرار تحديد المواقع للخطوط
+    l1 = st.slider("Start Line Position (Left)", 0, 100, 20)
+    l2 = st.slider("Finish Line Position (Right)", 0, 100, 80)
+    st.session_state.line1_percent = l1
+    st.session_state.line2_percent = l2
+with col_conf3:
+    if st.button("🔄 RESET SYSTEM", type="primary"):
+        st.session_state.reset_trigger = True
+        # خدعة بسيطة لإعادة التفعيل سريعاً
+        time.sleep(0.1)
+        st.session_state.reset_trigger = False
+        st.rerun()
 
-# --- قسم المعايرة (مبسط) ---
-with st.expander("⚙️ Step 1: Calibration (Pixels per Meter)", expanded=True):
-    st.write("Draw lines on screen conceptually. If distance between markers is 2m:")
-    real_dist = st.number_input("Real Distance (m)", value=2.0)
-    pixel_dist = st.number_input("Pixels on screen (Estimate)", value=200)
+st.markdown("---")
+
+# التبويبات
+tab1, tab2 = st.tabs(["🛣️ 1. Asphalt (Reference)", "🌾 2. Field (Measurement)"])
+
+with tab1:
+    st.markdown("### Step 1: Measure Theoretical Speed")
+    st.info("Align the lines with your markers on the ground. Drive the tractor through.")
     
-    if st.button("Set PPM"):
-        st.session_state.ppm = pixel_dist / real_dist
-        st.success(f"PPM Set: {st.session_state.ppm}")
-
-# --- قسم السرعة المرجعية ---
-with st.expander("🏎️ Step 2: Set Reference Speed (Asphalt)", expanded=True):
-    col1, col2 = st.columns(2)
-    manual_v = col1.number_input("Enter V_theo manually (if known)", value=5.4)
-    if col1.button("Set V_theo"):
-        st.session_state.v_theo = manual_v
-        st.success(f"Reference Speed Fixed: {manual_v} km/h")
+    # تشغيل الكاميرا
+    ctx1 = webrtc_streamer(key="trap-cam-1", video_transformer_factory=SpeedTrapProcessor, rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
     
-    col2.metric("Current V_theo", f"{st.session_state.v_theo} km/h")
+    # مكان لإدخال السرعة يدوياً بعد رؤيتها على الشاشة
+    col_res1, col_res2 = st.columns(2)
+    with col_res1:
+        manual_speed = st.number_input("Enter the Speed shown on camera (km/h):", value=0.0, step=0.1)
+    with col_res2:
+        if st.button("💾 Save as Theoretical Speed"):
+            st.session_state.v_theo = manual_speed
+            st.success(f"Saved: {manual_speed} km/h")
 
-# --- الشاشة الرئيسية ---
-st.markdown("### 📺 Monitoring Screen")
-
-if source_option == "📷 Live Camera (WebRTC)":
-    st.info("Ensure you allow camera access. Works on Mobile & PC.")
-    webrtc_streamer(key="tractor", video_transformer_factory=TractorTracker)
-
-else: # Upload Video
-    uploaded_video = st.file_uploader("Upload Video", type=['mp4', 'avi'])
-    if uploaded_video:
-        tfile = tempfile.NamedTemporaryFile(delete=False)
-        tfile.write(uploaded_video.read())
-        cap = cv2.VideoCapture(tfile.name)
+with tab2:
+    st.markdown("### Step 2: Measure Slip")
+    
+    if st.session_state.v_theo == 0:
+        st.warning("Please set Theoretical Speed in Tab 1 first.")
+    else:
+        st.metric("Theoretical Speed (Fixed)", f"{st.session_state.v_theo} km/h")
         
-        st_frame = st.empty()
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: break
+        # تشغيل الكاميرا للحقل
+        ctx2 = webrtc_streamer(key="trap-cam-2", video_transformer_factory=SpeedTrapProcessor, rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+        
+        # حاسبة الانزلاق
+        st.markdown("#### Slip Calculator")
+        c1, c2, c3 = st.columns(3)
+        field_speed = c1.number_input("Enter Field Speed (from camera):", min_value=0.0)
+        
+        if field_speed > 0:
+            slip = ((st.session_state.v_theo - field_speed) / st.session_state.v_theo) * 100
+            c2.metric("Calculated Slip", f"{slip:.2f} %")
             
-            # نفس منطق المعالجة هنا (مبسط للعرض)
-            results = model.track(frame, persist=True, verbose=False)
-            if results[0].boxes.id is not None:
-                box = results[0].boxes.xyxy[0].cpu().numpy()
-                cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 2)
-            
-            st_frame.image(frame, channels="BGR")
+            status = "Unknown"
+            if slip < 15: status = "✅ Good"
+            elif slip < 20: status = "⚠️ Warning"
+            else: status = "🔴 HIGH SLIP"
+            c3.markdown(f"## {status}")
